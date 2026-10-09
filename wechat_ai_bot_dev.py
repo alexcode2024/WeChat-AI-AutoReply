@@ -666,17 +666,20 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         
     user_orig_hwnd = user32.GetForegroundWindow()
     send_success = False
+    pasted = False  # 是否已把回复文本粘贴进输入框 (重试仅补发回车，从根上杜绝重复发送)
     for attempt in range(1, 3):
         # 1. 局部消息模拟点击输入框聚焦 (物理鼠标 0 像素移动)
         post_click_client_point(hwnd, int(0.55 * cur_W), int(cur_H - 0.08 * cur_H))
         time.sleep(0.02)
         
         # 2. 剪贴板填充真实完整文本 (带防冲突退避重试)
-        if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
-            log(f"⚠️ [剪贴板写入受阻(尝试 {attempt}/2)] 系统剪贴板正被其他程序独占，稍后重试...")
-            time.sleep(0.05)
-            continue
-        time.sleep(0.02)
+        # ⚠️ 仅在尚未粘贴成功前写入并粘贴；二次重试绝不重复 Ctrl+V，避免同一条消息被真实发送两次
+        if not pasted:
+            if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
+                log(f"⚠️ [剪贴板写入受阻(尝试 {attempt}/2)] 系统剪贴板正被其他程序独占，稍后重试...")
+                time.sleep(0.05)
+                continue
+            time.sleep(0.02)
         
         # 3. 极速瞬态激活注入 (15ms 瞬态，绝不挪动鼠标)
         cur_thread = user32.GetWindowThreadProcessId(user_orig_hwnd, None) if user_orig_hwnd else 0
@@ -695,12 +698,15 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
             time.sleep(0.01)
             
             # 发送真实的 Ctrl+V 组合键 (彻底杜绝误发单字母 v)
-            user32.keybd_event(0x11, 0, 0, 0)
-            user32.keybd_event(0x56, 0, 0, 0)
-            time.sleep(0.01)
-            user32.keybd_event(0x56, 0, 0x0002, 0)
-            user32.keybd_event(0x11, 0, 0x0002, 0)
-            time.sleep(0.02)
+            # 仅首轮执行粘贴：若已粘贴过，说明文本早已进入输入框，本次仅补发回车确认
+            if not pasted:
+                user32.keybd_event(0x11, 0, 0, 0)
+                user32.keybd_event(0x56, 0, 0, 0)
+                time.sleep(0.01)
+                user32.keybd_event(0x56, 0, 0x0002, 0)
+                user32.keybd_event(0x11, 0, 0x0002, 0)
+                pasted = True
+                time.sleep(0.02)
             
             # 回车发送
             user32.keybd_event(0x0D, 0, 0, 0)
@@ -718,12 +724,20 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
             if attached_my:
                 user32.AttachThreadInput(my_thread, wx_thread, False)
             
-        # 5. 🔍 真彩绿底闭环验收
-        if verify_outgoing_bubble_success(hwnd, cur_layout):
+        # 5. 🔍 真彩绿底闭环验收 (多帧连续采样，消除长文本气泡渲染延迟导致的误判)
+        verified = False
+        for _poll in range(3):
+            if verify_outgoing_bubble_success(hwnd, cur_layout):
+                verified = True
+                break
+            time.sleep(0.16)
+
+        if verified:
             send_success = True
             break
         else:
-            log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新绿底气泡，正在执行强力二次重试...")
+            # 二次重试只补发回车 (不再重复粘贴)，输入框已空时回车为空操作，绝不会重复回复
+            log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新绿底气泡，正在补发回车确认...")
             time.sleep(0.10)
     
     # 还原用户原本的剪贴板 (带安全重试)
