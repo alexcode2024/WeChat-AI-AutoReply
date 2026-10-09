@@ -177,6 +177,7 @@ class WeChatBotGUI(tk.Tk):
                 "temperature": 0.7
             },
             "system_prompt": DEFAULT_PROMPTS["🌟 真人日常 (默认)"],
+            "friend_personas": {},
             "reply_prefix": "[AI自动回复] ",
             "include_prefix": False,
             "whitelist_mode": True,
@@ -371,12 +372,115 @@ class WeChatBotGUI(tk.Tk):
 
         ttk.Label(top_p, text="💡 提示: 选择上方预设后，可直接在下方编辑框进行深度定制微调。", foreground="#666666", font=("微软雅黑", 8)).pack(side=tk.LEFT)
 
-        self.txt_prompt = scrolledtext.ScrolledText(self.tab_prompt, wrap=tk.WORD, height=14, font=("微软雅黑", 9))
+        self.txt_prompt = scrolledtext.ScrolledText(self.tab_prompt, wrap=tk.WORD, height=8, font=("微软雅黑", 9))
         self.txt_prompt.pack(fill=tk.BOTH, expand=True, pady=4)
 
         btn_p = ttk.Frame(self.tab_prompt)
-        btn_p.pack(fill=tk.X, pady=8)
+        btn_p.pack(fill=tk.X, pady=(0, 6))
         ttk.Button(btn_p, text="💾 保存人设 Prompt", command=self.save_ui_to_config).pack(side=tk.RIGHT)
+
+        # ---- 好友专属风格 (friend_personas)：按昵称覆盖上方通用人设，优先级更高 ----
+        grp_persona = ttk.LabelFrame(
+            self.tab_prompt,
+            text=" 👥 好友专属风格（可选：为某个好友单独指定人设，优先级高于上方通用人设） ",
+            padding=8)
+        grp_persona.pack(fill=tk.BOTH, expand=True, pady=(4, 0))
+
+        pf_left = ttk.Frame(grp_persona)
+        pf_left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        self.listbox_persona = tk.Listbox(pf_left, height=6, font=("微软雅黑", 9), exportselection=False)
+        self.listbox_persona.pack(fill=tk.BOTH, expand=True)
+        self.listbox_persona.bind("<<ListboxSelect>>", self.on_persona_select)
+
+        pf_right = ttk.Frame(grp_persona)
+        pf_right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+
+        row_pf1 = ttk.Frame(pf_right)
+        row_pf1.pack(fill=tk.X)
+        ttk.Label(row_pf1, text="好友昵称:").pack(side=tk.LEFT, padx=(0, 4))
+        self.ent_persona_name = ttk.Entry(row_pf1)
+        self.ent_persona_name.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self.txt_persona = tk.Text(pf_right, height=4, wrap=tk.WORD, font=("微软雅黑", 9))
+        self.txt_persona.pack(fill=tk.BOTH, expand=True, pady=(6, 0))
+
+        row_pf2 = ttk.Frame(pf_right)
+        row_pf2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(row_pf2, text="💾 保存该好友风格", command=self.save_persona).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(row_pf2, text="🗑 清除该好友风格", command=self.delete_persona).pack(side=tk.LEFT)
+
+    def _personas(self):
+        personas = self.config_data.get("friend_personas")
+        if not isinstance(personas, dict):
+            personas = {}
+            self.config_data["friend_personas"] = personas
+        return personas
+
+    def refresh_persona_list(self, select_name=None):
+        """左侧列表 = "默认" + 白名单好友 + 已配置专属风格的好友；右侧编辑选中项的风格。"""
+        personas = self._personas()
+        names = ["默认"]
+        candidates = list(self.config_data.get("whitelist", []) or []) + sorted(personas.keys())
+        for n in candidates:
+            n = (n or "").strip()
+            if n and n not in names:
+                names.append(n)
+        self._persona_names = names
+
+        self.listbox_persona.delete(0, tk.END)
+        for n in names:
+            self.listbox_persona.insert(tk.END, f"{n} ✔" if n in personas else n)
+
+        idx = None
+        if select_name in names:
+            idx = names.index(select_name)
+        elif select_name is None:
+            idx = 0
+        if idx is not None:
+            self.listbox_persona.selection_clear(0, tk.END)
+            self.listbox_persona.selection_set(idx)
+            self.listbox_persona.see(idx)
+            self._load_persona_into_editor(names[idx])
+
+    def _load_persona_into_editor(self, name):
+        personas = self._personas()
+        self.ent_persona_name.delete(0, tk.END)
+        self.ent_persona_name.insert(0, name)
+        self.txt_persona.delete("1.0", tk.END)
+        self.txt_persona.insert(tk.END, personas.get(name, ""))
+
+    def on_persona_select(self, event=None):
+        sel = self.listbox_persona.curselection()
+        if not sel:
+            return
+        names = getattr(self, "_persona_names", [])
+        if sel[0] < len(names):
+            self._load_persona_into_editor(names[sel[0]])
+
+    def save_persona(self):
+        name = self.ent_persona_name.get().strip()
+        if not name:
+            messagebox.showwarning("提示", "请先填写好友昵称（需与微信里显示的昵称一致）。")
+            return
+        text = self.txt_persona.get("1.0", tk.END).strip()
+        personas = self._personas()
+        if text:
+            personas[name] = text
+        else:
+            personas.pop(name, None)
+        if self.save_config():
+            messagebox.showinfo("保存成功", f"✅ 已保存【{name}】的专属风格，后台守护进程会自动应用。")
+            self.refresh_persona_list(name)
+
+    def delete_persona(self):
+        name = self.ent_persona_name.get().strip()
+        personas = self._personas()
+        if name not in personas:
+            messagebox.showinfo("提示", f"【{name}】目前没有专属风格。")
+            return
+        personas.pop(name, None)
+        if self.save_config():
+            self.refresh_persona_list(name)
 
     # 3. TAB: Whitelist
     def build_tab_whitelist(self):
@@ -469,6 +573,8 @@ class WeChatBotGUI(tk.Tk):
         self.listbox_bl.delete(0, tk.END)
         for b in c.get("blacklist", []):
             self.listbox_bl.insert(tk.END, b)
+
+        self.refresh_persona_list()
 
     def save_ui_to_config(self, show_msg=True):
         self.config_data["ai_engine"] = self.var_engine.get()

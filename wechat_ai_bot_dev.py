@@ -5,6 +5,7 @@ import json
 import re
 import sqlite3
 import hashlib
+import traceback
 import ctypes
 from ctypes import wintypes
 import numpy as np
@@ -71,6 +72,18 @@ MEMORY_CONTEXT_CHAR_LIMIT = 8000
 # 至少保留的最近上下文条数（保证起码含一轮完整问答）
 MEMORY_CONTEXT_MIN_MSGS = 2
 
+# --- 大模型调用失败后的行为参数 ---
+# 接口失败后的重试冷却（秒）：冷却期内不再重复调用，避免接口故障时每个扫描周期都空转重试
+API_RETRY_COOLDOWN_SECONDS = 20.0
+
+# 未配置 system_prompt 时使用的兜底人设（与 GUI 默认预设保持一致）
+DEFAULT_SYSTEM_PROMPT = (
+    "你现在是微信账号的主人（真实本人）。请以我（主人本人）的第一人称、自然口语、"
+    "亲切随和的日常语气直接回复微信好友的消息。就像我本人在用手机打字聊天一样自然。"
+    "严禁透露任何AI、机器人或助理身份，严禁使用客套机械的客服腔，"
+    "严禁输出任何解释或markdown格式，直接输出我回复的那句话。"
+)
+
 try:
     if sys.stdout:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -120,6 +133,7 @@ ocr_engine = init_ocr()
 LAST_PROCESSED_SIGNATURE = {}
 API_CONVERSATION_HISTORY = {}
 LAST_CLICKED_CANDIDATE_TIME = {}
+LAST_API_FAILURE_TIME = {}
 LAST_CHAT_HASH = None
 LAST_SIDEBAR_HASH = None
 LAST_FULL_SCAN_TIME = 0
@@ -624,12 +638,21 @@ def select_context_history(history,
 def generate_ai_reply(sender, message_content):
     cfg = load_config()
     now_time = time.strftime("%H:%M")
-    persona_desc = cfg.get("friend_personas", {}).get(sender, "幽默风趣、随和自然的真实好友")
-    
+    personas = cfg.get("friend_personas") or {}
+    persona_desc = (
+        personas.get(sender)
+        or personas.get("默认")
+        or "幽默风趣、随和自然的真实好友"
+    )
+    # 以 GUI「人设」页保存的 system_prompt 为基底，再叠加当前好友与场景信息
+    base_prompt = (cfg.get("system_prompt") or "").strip() or DEFAULT_SYSTEM_PROMPT
+
     system_prompt = (
-        f"你现在是微信账号的主人本人（真实真人），正在微信上与好友【{sender}】聊天。当前时间是{now_time}。\n"
-        f"【专属人设风格】：{persona_desc}\n"
-        "【对话规则】：直接输出发给对方的一句中文，口语化自然、简练得体。严禁括号描写心理活动，严禁透露AI身份。"
+        f"{base_prompt}\n"
+        f"【当前对话对象】：微信好友【{sender}】，当前时间 {now_time}。\n"
+        f"【该好友专属风格】：{persona_desc}\n"
+        "【输出要求】：只输出你要发给对方的那一句中文，口语化自然、简练得体，"
+        "不要任何括号动作或心理描写，不要解释，不要 markdown 格式。"
     )
     
     oa = cfg.get("openai_api", {})
@@ -664,11 +687,15 @@ def generate_ai_reply(sender, message_content):
                 append_history_to_db(sender, message_content, cleaned, keep=MEMORY_KEEP_PER_FRIEND)
                 return cleaned
             else:
-                log(f"API HTTP {res.status_code}: {res.text[:100]}")
+                log(f"❌ [大模型接口异常] HTTP {res.status_code}: {res.text[:150]}")
         except Exception as e:
-            log(f"API Error: {e}")
-            
-    return f"在呢，刚才没注意看手机，怎么啦？"
+            log(f"❌ [大模型接口异常] {type(e).__name__}: {e}")
+    else:
+        log("❌ [大模型未配置] api_url 或 api_key 为空，无法生成回复。")
+
+    # 关键安全策略：生成失败时返回空字符串 → 上层判定为"本轮不发送"。
+    # 绝不用固定话术顶替，避免接口故障时以账号主人身份向好友发出假消息。
+    return ""
 
 def verify_outgoing_bubble_success(hwnd, layout):
     """
@@ -1012,6 +1039,10 @@ def scan_and_reply_wechat(hwnd):
                     # 🌟 极速动态像素沉降判定 (Dynamic Pixel Settling):
                     # 短暂等待 0.35 秒 (人类打字发句最小停顿)，若右侧气泡像素无变动，立即判定单句发送完毕，0秒多余等待直接交由 AI！
                     # 若检测到右侧像素哈希发生改变（连发新气泡），则等待 0.15 秒排版沉降后增量 OCR 聚合全部短句！
+                    # ⏳ 大模型接口失败冷却门禁：冷却期内不重复调用，避免接口故障时每个扫描周期空转
+                    if (time.time() - LAST_API_FAILURE_TIME.get(current_active_target, 0.0)) < API_RETRY_COOLDOWN_SECONDS:
+                        return
+
                     time.sleep(0.35)
                     img_latest, _, _ = grab_wechat_window(hwnd)
                     if img_latest:
@@ -1037,10 +1068,18 @@ def scan_and_reply_wechat(hwnd):
                     
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
                     ai_reply = generate_ai_reply(current_active_target, combined_text)
-                    if ai_reply:
-                        prefix = cfg.get("reply_prefix", "") if cfg.get("include_prefix", False) else ""
-                        final_reply = f"{prefix}{ai_reply}"
-                        send_reply_instant(hwnd, rect, layout, current_active_target, final_reply)
+                    if not ai_reply:
+                        # 🛡️ 安全熔断：大模型不可用时宁可漏回，绝不冒充号主给好友发假消息。
+                        # 撤销本次签名并进入冷却，冷却结束后下一周期自动重试同一句消息。
+                        LAST_PROCESSED_SIGNATURE.pop(current_active_target, None)
+                        LAST_API_FAILURE_TIME[current_active_target] = time.time()
+                        log(f"⏳ 【{current_active_target}】本轮未生成回复，已跳过发送（未发出任何内容）；"
+                            f"{API_RETRY_COOLDOWN_SECONDS:.0f} 秒后自动重试。")
+                        return
+                    LAST_API_FAILURE_TIME.pop(current_active_target, None)
+                    prefix = cfg.get("reply_prefix", "") if cfg.get("include_prefix", False) else ""
+                    final_reply = f"{prefix}{ai_reply}"
+                    send_reply_instant(hwnd, rect, layout, current_active_target, final_reply)
                 
                 # 只要当前会话存在待回复/刚回复的消息，直接 return，100% 物理阻断后续任何红点跳转！
                 return
@@ -1087,12 +1126,45 @@ def scan_and_reply_wechat(hwnd):
 # =============================================================================
 # 8. DAEMON MAIN LOOP
 # =============================================================================
-def main_loop():
+def is_my_bot_process(proc):
+    """确认某进程确实是本守护进程，避免 PID 复用误判。"""
+    try:
+        cmd_str = " ".join(str(c) for c in (proc.cmdline() or [])).lower()
+        return "wechat_ai_bot_dev" in cmd_str
+    except Exception:
+        return False
+
+def acquire_single_instance():
+    """
+    单实例门禁：发现已有守护进程在运行就直接放弃启动。
+    彻底杜绝"两个进程同时抢答 → 同一条消息被回复两次"。
+    """
+    if os.path.exists(PID_FILE):
+        old_pid = None
+        try:
+            with open(PID_FILE, "r", encoding="utf-8") as f:
+                old_pid = int(f.read().strip())
+        except Exception:
+            old_pid = None
+
+        if old_pid and old_pid != os.getpid() and psutil.pid_exists(old_pid):
+            try:
+                if is_my_bot_process(psutil.Process(old_pid)):
+                    log(f"🚫 守护进程已在运行 (PID: {old_pid})，本次启动自动退出，避免重复回复。")
+                    return False
+            except Exception:
+                pass
+
     try:
         with open(PID_FILE, "w", encoding="utf-8") as f:
             f.write(str(os.getpid()))
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"⚠️ PID 文件写入失败: {e}")
+    return True
+
+def main_loop():
+    if not acquire_single_instance():
+        return
 
     # 初始化长期记忆库（SQLite），重启后自动恢复各好友上下文
     if init_memory_db():
@@ -1114,6 +1186,8 @@ def main_loop():
             interval = float(cfg.get("check_interval_seconds", 0.8))
             time.sleep(interval)
         except Exception as e:
+            log(f"⚠️ [主循环异常] {type(e).__name__}: {e}")
+            log(traceback.format_exc().rstrip())
             time.sleep(1.0)
 
 if __name__ == "__main__":
