@@ -687,7 +687,11 @@ def generate_ai_reply(sender, message_content):
                 append_history_to_db(sender, message_content, cleaned, keep=MEMORY_KEEP_PER_FRIEND)
                 return cleaned
             else:
-                log(f"❌ [大模型接口异常] HTTP {res.status_code}: {res.text[:150]}")
+                # 部分服务商会在报错响应里回显请求内容，此处做一次防回显兜底
+                err_body = res.text[:150]
+                if message_content and len(message_content) >= 4 and message_content[:4] in err_body:
+                    err_body = "(响应体包含对话内容，已隐藏)"
+                log(f"❌ [大模型接口异常] HTTP {res.status_code}: {err_body}")
         except Exception as e:
             log(f"❌ [大模型接口异常] {type(e).__name__}: {e}")
     else:
@@ -802,7 +806,8 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
             log(f"🚫 [安全熔断] 未在列表中定位到目标【{target}】，放弃本次发送以防串发！")
             return False
             
-    log(f"📤 正在回复【{target}】: {final_reply}")
+    # 隐私保护：日志只记录系统元信息，绝不写入对话正文
+    log(f"📤 正在回复【{target}】（{len(final_reply)} 字，正文不记入日志）")
     
     # 剪贴板原子快照保护
     user_old_clip = None
@@ -1066,7 +1071,9 @@ def scan_and_reply_wechat(hwnd):
                             
                     LAST_PROCESSED_SIGNATURE[current_active_target] = current_sig
                     
-                    log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】新消息({len(pending_bubbles)}条): \"{combined_text}\"")
+                    # 隐私保护：日志只记录系统元信息，绝不写入对话正文
+                    log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】"
+                        f"新消息 {len(pending_bubbles)} 条（{len(combined_text)} 字，正文不记入日志）")
                     ai_reply = generate_ai_reply(current_active_target, combined_text)
                     if not ai_reply:
                         # 🛡️ 安全熔断：大模型不可用时宁可漏回，绝不冒充号主给好友发假消息。
