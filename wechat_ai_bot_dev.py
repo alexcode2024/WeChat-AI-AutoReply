@@ -76,6 +76,12 @@ MEMORY_CONTEXT_MIN_MSGS = 2
 # 接口失败后的重试冷却（秒）：冷却期内不再重复调用，避免接口故障时每个扫描周期都空转重试
 API_RETRY_COOLDOWN_SECONDS = 20.0
 
+# --- 发送可靠性参数 ---
+# 粘贴后核验输入框是否真的出现文字的最大尝试次数（粘贴失败绝不按回车）
+PASTE_VERIFY_RETRIES = 3
+# 发送失败后的重试冷却（秒）：此时回复已生成并缓存，重试只重发、不重复调用大模型
+SEND_RETRY_COOLDOWN_SECONDS = 5.0
+
 # 未配置 system_prompt 时使用的兜底人设（与 GUI 默认预设保持一致）
 DEFAULT_SYSTEM_PROMPT = (
     "你现在是微信账号的主人（真实本人）。请以我（主人本人）的第一人称、自然口语、"
@@ -134,6 +140,10 @@ LAST_PROCESSED_SIGNATURE = {}
 API_CONVERSATION_HISTORY = {}
 LAST_CLICKED_CANDIDATE_TIME = {}
 LAST_API_FAILURE_TIME = {}
+LAST_SEND_FAILURE_TIME = {}
+# 已生成但尚未成功发出的回复缓存: target -> {"incoming": 原文, "reply": 回复, "created": 时间}
+# 作用：发送失败重试时直接复用，绝不重复消耗大模型额度
+PENDING_REPLY = {}
 LAST_CHAT_HASH = None
 LAST_SIDEBAR_HASH = None
 LAST_FULL_SCAN_TIME = 0
@@ -681,10 +691,9 @@ def generate_ai_reply(sender, message_content):
             if res.status_code == 200:
                 reply = res.json()["choices"][0]["message"]["content"]
                 cleaned = clean_ai_reply(reply)
-                history.append({"role": "user", "content": message_content})
-                history.append({"role": "assistant", "content": cleaned})
-                API_CONVERSATION_HISTORY[sender] = history[-MEMORY_INMEM_LIMIT:]
-                append_history_to_db(sender, message_content, cleaned, keep=MEMORY_KEEP_PER_FRIEND)
+                # 注意：这里只"生成"，不落库。必须等消息真正发出去之后，
+                # 由上层调用 commit_reply_to_memory() 写入记忆库，
+                # 从根上杜绝"日志显示已回复、记忆库里也有，但好友其实没收到"的假历史。
                 return cleaned
             else:
                 # 部分服务商会在报错响应里回显请求内容，此处做一次防回显兜底
@@ -701,38 +710,192 @@ def generate_ai_reply(sender, message_content):
     # 绝不用固定话术顶替，避免接口故障时以账号主人身份向好友发出假消息。
     return ""
 
-def verify_outgoing_bubble_success(hwnd, layout):
+def commit_reply_to_memory(sender, user_msg, assistant_msg):
     """
-    发送后真彩绿底闭环验收引擎：
-    在回车发送后截取聊天区底部，校验是否真正长出了微信特征绿底 (#95EC69) 气泡！
+    把一轮"已确认发出"的对话写入长期记忆库（内存上下文 + SQLite 双写）。
+    只有 send_reply_instant() 返回 True 时才会被调用，
+    保证记忆库与微信里真实存在的消息严格一一对应。
     """
+    if not user_msg or not assistant_msg:
+        return
+    history = API_CONVERSATION_HISTORY.get(sender)
+    if history is None:
+        history = load_history_from_db(sender, limit=MEMORY_LOAD_LIMIT)
+    history.append({"role": "user", "content": user_msg})
+    history.append({"role": "assistant", "content": assistant_msg})
+    API_CONVERSATION_HISTORY[sender] = history[-MEMORY_INMEM_LIMIT:]
+    append_history_to_db(sender, user_msg, assistant_msg, keep=MEMORY_KEEP_PER_FRIEND)
+
+# ---- Win32 SendInput 结构体：比老旧的 keybd_event 更可靠 ----
+class _KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class _MOUSEINPUT(ctypes.Structure):
+    _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG), ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))]
+
+class _HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", _KEYBDINPUT), ("mi", _MOUSEINPUT), ("hi", _HARDWAREINPUT)]
+
+class _INPUT(ctypes.Structure):
+    _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+def send_key_combo(*vks, hold_ms=12):
+    """
+    原子化发送组合键：一次性把"全部按下 + 逆序抬起"作为一个批次投递。
+    相比逐个 keybd_event，能有效避免 Ctrl 修饰键在半途丢失导致只落下一个 'v'。
+    返回是否投递成功（失败时自动回退到 keybd_event）。
+    """
+    events = []
+    for vk in vks:
+        inp = _INPUT(); inp.type = 1
+        inp.u.ki = _KEYBDINPUT(vk, 0, 0, 0, None)
+        events.append(inp)
+    for vk in reversed(vks):
+        inp = _INPUT(); inp.type = 1
+        inp.u.ki = _KEYBDINPUT(vk, 0, 0x0002, 0, None)
+        events.append(inp)
     try:
-        time.sleep(0.22)
-        img_verify, _, _ = grab_wechat_window(hwnd)
-        if not img_verify:
-            return False
-            
-        W, H = img_verify.size
-        arr_v = np.array(img_verify)
-        chat_start_x = layout["chat_start_x"]
-        input_h = layout["input_h"]
-        
-        # 采样聊天视窗底部最后 220px 区域 (即最新发出的气泡所在的右侧区域)
-        y1 = max(0, int(H - input_h - 220))
-        y2 = min(H, int(H - input_h + 15))
-        x1 = int(chat_start_x + 0.20 * (W - chat_start_x)) # 偏右侧 (我发绿底气泡区域)
-        x2 = min(W, int(W - 10))
-        
-        patch = arr_v[y1:y2, x1:x2]
-        if patch.size == 0:
-            return False
-            
-        # 微信特征绿底色判定 (转 int 杜绝浅色背景回绕溢出)
-        pr, pg, pb = patch[:, :, 0].astype(int), patch[:, :, 1].astype(int), patch[:, :, 2].astype(int)
-        green_mask = (pg > pr + 18) & (pg > pb + 18) & (pg > 45)
-        return np.sum(green_mask) >= 18
+        arr = (_INPUT * len(events))(*events)
+        sent = user32.SendInput(len(events), arr, ctypes.sizeof(_INPUT))
+        if sent == len(events):
+            return True
+    except Exception:
+        pass
+    try:  # 兜底：老接口逐个发送
+        for vk in vks:
+            user32.keybd_event(vk, 0, 0, 0)
+            time.sleep(hold_ms / 1000.0)
+        for vk in reversed(vks):
+            user32.keybd_event(vk, 0, 0x0002, 0)
+        return True
     except Exception:
         return False
+
+def ensure_wechat_foreground(hwnd):
+    """
+    把微信窗口真正切到前台（键盘焦点必须真的在微信上，按键才能进去）。
+    依次尝试多种方法，最终以 GetForegroundWindow() 是否等于微信窗口为准。
+    注意：这里绝不注入任何按键，避免打扰当前前台程序。
+    """
+    try:
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        if user32.IsIconic(hwnd):
+            user32.ShowWindow(hwnd, 9) # SW_RESTORE
+            time.sleep(0.08)
+        fg = user32.GetForegroundWindow()
+        wx_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        my_thread = kernel32.GetCurrentThreadId()
+        attached = []
+        try:
+            for t in (user32.GetWindowThreadProcessId(fg, None) if fg else 0, my_thread):
+                if t and t != wx_thread and user32.AttachThreadInput(t, wx_thread, True):
+                    attached.append(t)
+            user32.SetForegroundWindow(hwnd)
+            if user32.GetForegroundWindow() != hwnd:
+                user32.BringWindowToTop(hwnd)
+                user32.SetForegroundWindow(hwnd)
+        finally:
+            for t in attached:
+                try:
+                    user32.AttachThreadInput(t, wx_thread, False)
+                except Exception:
+                    pass
+        time.sleep(0.06)
+        return user32.GetForegroundWindow() == hwnd
+    except Exception:
+        return False
+
+def capture_green_strip(hwnd, layout):
+    """
+    采样"输入框正上方 80px"这一窄条区域，返回 (绿色像素数, 指纹哈希)。
+    只取极窄的一条：新发出的绿底气泡必然落在这里，而旧气泡会被顶出该条带，
+    因此前后对比的"增量"能真实反映"是否真的长出了新气泡"。
+    """
+    try:
+        img, _, _ = grab_wechat_window(hwnd)
+        if not img:
+            return None
+        W, H = img.size
+        chat_start_x = layout["chat_start_x"]
+        input_h = layout["input_h"]
+        y1 = max(0, int(H - input_h - 86))
+        y2 = min(H, int(H - input_h - 6))
+        x1 = int(chat_start_x + 0.20 * (W - chat_start_x)) # 偏右侧：我方绿底气泡区域
+        x2 = min(W, int(W - 10))
+        patch = np.array(img)[y1:y2, x1:x2]
+        if patch.size == 0:
+            return None
+        pr = patch[:, :, 0].astype(int)
+        pg = patch[:, :, 1].astype(int)
+        pb = patch[:, :, 2].astype(int)
+        green_mask = (pg > pr + 18) & (pg > pb + 18) & (pg > 45)
+        return int(green_mask.sum()), hashlib.md5(np.packbits(green_mask).tobytes()).hexdigest()
+    except Exception:
+        return None
+
+def verify_outgoing_bubble_success(hwnd, layout, pre_signature):
+    """
+    发送后真彩绿底闭环验收引擎（增量判定版）：
+    必须相对"按下回车之前"的图像确有新增绿色气泡，才判定发送成功。
+    绝不再使用固定阈值——旧实现只要该区域存在任意绿色就返回 True，
+    会在深色主题下恒为 True，把"根本没发出去"谎报成"秒回成功"。
+    """
+    if not pre_signature:
+        return False
+    pre_px = pre_signature[0]
+    for _poll in range(3):
+        time.sleep(0.25)
+        post = capture_green_strip(hwnd, layout)
+        if post and post[0] >= pre_px + 300 and post[1] != pre_signature[1]:
+            return True
+    return False
+
+def capture_input_ink_signature(hwnd, layout):
+    """
+    采样微信输入框正文区域，返回 (文字列数, 墨迹像素数, 指纹哈希)。
+    以区域自身的背景中位色为基准统计"偏离背景的像素"，因此浅色/深色主题都适用。
+    用"文字列数"而非像素总数做主判据：光标闪烁只有 1~2 列，不会造成误判。
+    """
+    try:
+        img, _, _ = grab_wechat_window(hwnd)
+        if not img:
+            return None
+        W, H = img.size
+        chat_start_x = layout["chat_start_x"]
+        input_h = layout["input_h"]
+        y1 = max(0, int(H - input_h + 0.06 * input_h))
+        y2 = min(H, int(H - input_h + 0.55 * input_h))
+        x1 = int(chat_start_x + 0.02 * (W - chat_start_x))
+        x2 = min(W, int(W * 0.92))
+        patch = np.array(img)[y1:y2, x1:x2].astype(int)
+        if patch.size == 0:
+            return None
+        bg = np.median(patch.reshape(-1, 3), axis=0)
+        ink = np.abs(patch - bg).sum(axis=2) > 90
+        cols = int(ink.any(axis=0).sum())
+        return cols, int(ink.sum()), hashlib.md5(np.packbits(ink).tobytes()).hexdigest()
+    except Exception:
+        return None
+
+def clear_chat_input(hwnd, layout):
+    """清空微信输入框残留文字（Ctrl+A 后 Delete），避免上一轮失败的文字被重复发送。"""
+    try:
+        post_click_client_point(hwnd, int(0.55 * layout["total_w_px"]),
+                                int(layout["total_h_px"] - 0.08 * layout["total_h_px"]))
+        time.sleep(0.04)
+        send_key_combo(0x11, 0x41) # Ctrl+A 全选输入框内文字
+        time.sleep(0.03)
+        send_key_combo(0x2E)       # Delete
+        time.sleep(0.05)
+    except Exception:
+        pass
 
 def safe_clipboard_copy(text, retries=3, delay=0.03):
     """
@@ -805,102 +968,96 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         else:
             log(f"🚫 [安全熔断] 未在列表中定位到目标【{target}】，放弃本次发送以防串发！")
             return False
-            
     # 隐私保护：日志只记录系统元信息，绝不写入对话正文
     log(f"📤 正在回复【{target}】（{len(final_reply)} 字，正文不记入日志）")
-    
+
     # 剪贴板原子快照保护
     user_old_clip = None
     try:
         user_old_clip = pyperclip.paste()
     except Exception:
         pass
-        
+
     user_orig_hwnd = user32.GetForegroundWindow()
     send_success = False
-    pasted = False  # 是否已把回复文本粘贴进输入框 (重试仅补发回车，从根上杜绝重复发送)
+    # 发送前的绿底气泡基线：只有相对基线确有"新增绿色"才算发送成功（旧的固定阈值恒为真）
+    pre_green = capture_green_strip(hwnd, cur_layout)
+    if pre_green is None:
+        # 抓不到画面就无法做闭环验收；此时发送无法被证实，宁可本轮不发，
+        # 否则重试路径可能把已经真正发出去的消息再发一遍。
+        log("❌ [发送中止] 未能捕获微信画面，本轮不发送（避免重复发送），稍后自动重试。")
+        return False
+
     for attempt in range(1, 3):
+        # 0. 关键前置：必须把微信真正切到前台。键盘事件只会送到前台窗口，
+        #    抢不到焦点时按键会打到别的程序里，还会造成"看起来回复了、其实没发出去"的假象。
+        #    此时宁可本轮不发，也绝不盲打字污染用户的其他窗口。
+        if not ensure_wechat_foreground(hwnd):
+            log("❌ [发送中止] 无法把微信窗口切到前台（前台可能被全屏程序/游戏占用），"
+                "本轮未发出任何内容，稍后自动重试。")
+            break
+
         # 1. 局部消息模拟点击输入框聚焦 (物理鼠标 0 像素移动)
         post_click_client_point(hwnd, int(0.55 * cur_W), int(cur_H - 0.08 * cur_H))
-        time.sleep(0.02)
-        
-        # 2. 剪贴板填充真实完整文本 (带防冲突退避重试)
-        # ⚠️ 仅在尚未粘贴成功前写入并粘贴；二次重试绝不重复 Ctrl+V，避免同一条消息被真实发送两次
-        if not pasted:
-            if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
-                log(f"⚠️ [剪贴板写入受阻(尝试 {attempt}/2)] 系统剪贴板正被其他程序独占，稍后重试...")
-                time.sleep(0.05)
-                continue
-            time.sleep(0.02)
-        
-        # 3. 极速瞬态激活注入 (15ms 瞬态，绝不挪动鼠标)
-        cur_thread = user32.GetWindowThreadProcessId(user_orig_hwnd, None) if user_orig_hwnd else 0
-        wx_thread = user32.GetWindowThreadProcessId(hwnd, None)
-        my_thread = kernel32.GetCurrentThreadId()
-        
-        attached_cur = False
-        attached_my = False
-        try:
-            if cur_thread and cur_thread != wx_thread:
-                attached_cur = bool(user32.AttachThreadInput(cur_thread, wx_thread, True))
-            if my_thread and my_thread != wx_thread:
-                attached_my = bool(user32.AttachThreadInput(my_thread, wx_thread, True))
-                
-            user32.SetForegroundWindow(hwnd)
-            time.sleep(0.01)
-            
-            # 发送真实的 Ctrl+V 组合键 (彻底杜绝误发单字母 v)
-            # 仅首轮执行粘贴：若已粘贴过，说明文本早已进入输入框，本次仅补发回车确认
-            if not pasted:
-                user32.keybd_event(0x11, 0, 0, 0)
-                user32.keybd_event(0x56, 0, 0, 0)
-                time.sleep(0.01)
-                user32.keybd_event(0x56, 0, 0x0002, 0)
-                user32.keybd_event(0x11, 0, 0x0002, 0)
-                pasted = True
-                time.sleep(0.02)
-            
-            # 回车发送
-            user32.keybd_event(0x0D, 0, 0, 0)
-            time.sleep(0.01)
-            user32.keybd_event(0x0D, 0, 0x0002, 0)
-            time.sleep(0.03)
-            
-            # 4. 瞬间恢复用户原本的窗口层级 (若微信原本在底层/后台，立即压回底层并恢复用户前台)
-            if user_orig_hwnd and user_orig_hwnd != hwnd:
-                user32.SetForegroundWindow(user_orig_hwnd)
-                user32.SetWindowPos(hwnd, 1, 0, 0, 0, 0, 0x0003 | 0x0010) # HWND_BOTTOM, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-        finally:
-            if attached_cur:
-                user32.AttachThreadInput(cur_thread, wx_thread, False)
-            if attached_my:
-                user32.AttachThreadInput(my_thread, wx_thread, False)
-            
-        # 5. 🔍 真彩绿底闭环验收 (多帧连续采样，消除长文本气泡渲染延迟导致的误判)
-        verified = False
-        for _poll in range(3):
-            if verify_outgoing_bubble_success(hwnd, cur_layout):
-                verified = True
-                break
-            time.sleep(0.16)
+        time.sleep(0.06)
 
-        if verified:
+        # 2. 先清空输入框，避免把上一轮残留的文字（例如失败时落下的单个字母）一起发出去
+        clear_chat_input(hwnd, cur_layout)
+        ink_before = capture_input_ink_signature(hwnd, cur_layout)
+
+        # 3. 粘贴文本并立即核验输入框是否真的出现了文字（没出现绝不按回车）
+        paste_ok = False
+        for paste_try in range(1, PASTE_VERIFY_RETRIES + 1):
+            if not safe_clipboard_copy(final_reply, retries=3, delay=0.03):
+                log(f"⚠️ [剪贴板写入受阻 {paste_try}/{PASTE_VERIFY_RETRIES}] 剪贴板被其他程序独占，重试中...")
+                time.sleep(0.06)
+                continue
+            time.sleep(0.03)
+            send_key_combo(0x11, 0x56) # Ctrl+V
+            time.sleep(0.35)
+            ink_after = capture_input_ink_signature(hwnd, cur_layout)
+            base_cols = ink_before[0] if ink_before else 0
+            if ink_after and ink_after[0] >= base_cols + 8 and ink_after[0] >= 8:
+                paste_ok = True
+                break
+            log(f"⚠️ [粘贴核验未通过 {paste_try}/{PASTE_VERIFY_RETRIES}] 输入框未检测到文字，重试中...")
+            time.sleep(0.12)
+
+        if not paste_ok:
+            log("❌ [发送中止] 回复文本没能写进微信输入框（窗口焦点被抢占或输入法拦截），本轮未发出任何内容。")
+            break
+
+        # 4. 回车发送
+        send_key_combo(0x0D)
+        time.sleep(0.30)
+
+        # 5. 🔍 真彩绿底闭环验收：必须相对发送前确有"新增绿色气泡"才算成功
+        if verify_outgoing_bubble_success(hwnd, cur_layout, pre_green):
             send_success = True
             break
-        else:
-            # 二次重试只补发回车 (不再重复粘贴)，输入框已空时回车为空操作，绝不会重复回复
-            log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新绿底气泡，正在补发回车确认...")
-            time.sleep(0.10)
-    
-    # 还原用户原本的剪贴板 (带安全重试)
+
+        log(f"⚠️ [发送闭环验收未通过(尝试 {attempt}/2)] 未检测到新绿底气泡。")
+        # 回车若没生效，输入框会残留文字；清空以防下一轮把同一条消息发两遍
+        clear_chat_input(hwnd, cur_layout)
+        pre_green = capture_green_strip(hwnd, cur_layout)
+        if pre_green is None:
+            break
+        time.sleep(0.12)
+
+    # 还原用户原本的前台窗口与剪贴板
+    if user_orig_hwnd and user_orig_hwnd != hwnd:
+        try:
+            user32.SetForegroundWindow(user_orig_hwnd)
+        except Exception:
+            pass
     if user_old_clip is not None:
         safe_clipboard_copy(user_old_clip, retries=2, delay=0.02)
-            
+
     if send_success:
-        log(f"✅ [后台静默秒回成功] 已回复【{target}】！(物理鼠标 0 移动，窗口层级已锁定)")
+        log(f"✅ [发送成功] 已回复【{target}】，并已确认绿底气泡出现。")
     else:
-        log(f"❌ [发送脱靶告警] 重试后仍未检测到绿底气泡！")
-    
+        log(f"❌ [发送失败] 【{target}】本轮回复未能送出。")
+
     return send_success
 
 # =============================================================================
@@ -1048,6 +1205,10 @@ def scan_and_reply_wechat(hwnd):
                     if (time.time() - LAST_API_FAILURE_TIME.get(current_active_target, 0.0)) < API_RETRY_COOLDOWN_SECONDS:
                         return
 
+                    # ⏳ 发送失败冷却门禁：上一轮没发出去时，冷却期内直接跳过等待（回复已缓存，重试不再花大模型额度）
+                    if (time.time() - LAST_SEND_FAILURE_TIME.get(current_active_target, 0.0)) < SEND_RETRY_COOLDOWN_SECONDS:
+                        return
+
                     time.sleep(0.35)
                     img_latest, _, _ = grab_wechat_window(hwnd)
                     if img_latest:
@@ -1074,19 +1235,38 @@ def scan_and_reply_wechat(hwnd):
                     # 隐私保护：日志只记录系统元信息，绝不写入对话正文
                     log(f"\n📩 [当前会话锁定·连发聚合] 收到当前好友【{current_active_target}】"
                         f"新消息 {len(pending_bubbles)} 条（{len(combined_text)} 字，正文不记入日志）")
-                    ai_reply = generate_ai_reply(current_active_target, combined_text)
-                    if not ai_reply:
-                        # 🛡️ 安全熔断：大模型不可用时宁可漏回，绝不冒充号主给好友发假消息。
-                        # 撤销本次签名并进入冷却，冷却结束后下一周期自动重试同一句消息。
-                        LAST_PROCESSED_SIGNATURE.pop(current_active_target, None)
-                        LAST_API_FAILURE_TIME[current_active_target] = time.time()
-                        log(f"⏳ 【{current_active_target}】本轮未生成回复，已跳过发送（未发出任何内容）；"
-                            f"{API_RETRY_COOLDOWN_SECONDS:.0f} 秒后自动重试。")
-                        return
-                    LAST_API_FAILURE_TIME.pop(current_active_target, None)
+
+                    # 复用上一轮"已生成但未发出"的回复：发送失败重试时不再重复调用大模型，省额度也更一致
+                    cached = PENDING_REPLY.get(current_active_target)
+                    if cached and cached.get("incoming") == combined_text:
+                        ai_reply = cached["reply"]
+                    else:
+                        ai_reply = generate_ai_reply(current_active_target, combined_text)
+                        if not ai_reply:
+                            # 🛡️ 安全熔断：大模型不可用时宁可漏回，绝不冒充号主给好友发假消息。
+                            # 撤销本次签名并进入冷却，冷却结束后下一周期自动重试同一句消息。
+                            LAST_PROCESSED_SIGNATURE.pop(current_active_target, None)
+                            LAST_API_FAILURE_TIME[current_active_target] = time.time()
+                            log(f"⏳ 【{current_active_target}】本轮未生成回复，已跳过发送（未发出任何内容）；"
+                                f"{API_RETRY_COOLDOWN_SECONDS:.0f} 秒后自动重试。")
+                            return
+                        LAST_API_FAILURE_TIME.pop(current_active_target, None)
+                        PENDING_REPLY[current_active_target] = {
+                            "incoming": combined_text, "reply": ai_reply, "created": time.time()}
+
                     prefix = cfg.get("reply_prefix", "") if cfg.get("include_prefix", False) else ""
                     final_reply = f"{prefix}{ai_reply}"
-                    send_reply_instant(hwnd, rect, layout, current_active_target, final_reply)
+                    if send_reply_instant(hwnd, rect, layout, current_active_target, final_reply):
+                        # ✅ 只有确认气泡真的发出去了，才把这一轮写进长期记忆库（从根上杜绝假历史）
+                        commit_reply_to_memory(current_active_target, combined_text, ai_reply)
+                        PENDING_REPLY.pop(current_active_target, None)
+                        LAST_SEND_FAILURE_TIME.pop(current_active_target, None)
+                    else:
+                        # ❌ 没发出去：撤销签名、不写记忆库，冷却后自动重试（复用缓存不重复生成）
+                        LAST_PROCESSED_SIGNATURE.pop(current_active_target, None)
+                        LAST_SEND_FAILURE_TIME[current_active_target] = time.time()
+                        log(f"⏳ 【{current_active_target}】本轮回复未发出（未写入记忆库），"
+                            f"{SEND_RETRY_COOLDOWN_SECONDS:.0f} 秒后自动重试。")
                 
                 # 只要当前会话存在待回复/刚回复的消息，直接 return，100% 物理阻断后续任何红点跳转！
                 return
