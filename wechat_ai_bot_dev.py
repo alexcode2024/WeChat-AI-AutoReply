@@ -55,6 +55,16 @@ PID_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.pid")
 LOG_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.log")
 DB_FILE = os.path.join(BASE_DIR, "wechat_memory.db")
 
+# --- 长期记忆（SQLite）容量参数 ---
+# 每个好友在数据库中长期保留的对话条数上限（1 条 = 一句 user 或 assistant 消息）
+MEMORY_KEEP_PER_FRIEND = 10000
+# 进程内首次触达某好友时，从数据库载入内存的条数
+MEMORY_LOAD_LIMIT = MEMORY_KEEP_PER_FRIEND
+# 进程内该好友的上下文缓存条数上限
+MEMORY_INMEM_LIMIT = MEMORY_KEEP_PER_FRIEND
+# 每次真正发送给大模型的上下文条数（控制 prompt 体积 / 延迟 / 费用，与存储上限解耦）
+MEMORY_CONTEXT_LIMIT = 8
+
 try:
     if sys.stdout:
         sys.stdout.reconfigure(encoding='utf-8', errors='replace')
@@ -537,7 +547,7 @@ def init_memory_db():
         log(f"⚠️ [长期记忆库初始化失败] {e}")
         return False
 
-def load_history_from_db(sender, limit=10):
+def load_history_from_db(sender, limit=MEMORY_LOAD_LIMIT):
     """从记忆库按时间正序取出该好友最近 limit 条对话。"""
     try:
         conn = sqlite3.connect(DB_FILE, timeout=5)
@@ -552,7 +562,7 @@ def load_history_from_db(sender, limit=10):
         log(f"⚠️ [长期记忆库读取失败] {e}")
         return []
 
-def append_history_to_db(sender, user_msg, assistant_msg, keep=10):
+def append_history_to_db(sender, user_msg, assistant_msg, keep=MEMORY_KEEP_PER_FRIEND):
     """
     把"好友新消息 + 我方回复"成对写入记忆库，并只保留该好友最近 keep 条，
     防止数据库无限膨胀。写入失败绝不影响正常回复流程。
@@ -604,10 +614,10 @@ def generate_ai_reply(sender, message_content):
         # 进程内首次触达该好友时，从 SQLite 长期记忆库恢复上下文；之后走内存缓存
         history = API_CONVERSATION_HISTORY.get(sender)
         if history is None:
-            history = load_history_from_db(sender, limit=10)
+            history = load_history_from_db(sender, limit=MEMORY_LOAD_LIMIT)
             API_CONVERSATION_HISTORY[sender] = history
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(history[-8:])
+        messages.extend(history[-MEMORY_CONTEXT_LIMIT:])
         messages.append({"role": "user", "content": message_content})
         
         payload = {"model": model, "messages": messages, "temperature": 0.7}
@@ -619,8 +629,8 @@ def generate_ai_reply(sender, message_content):
                 cleaned = clean_ai_reply(reply)
                 history.append({"role": "user", "content": message_content})
                 history.append({"role": "assistant", "content": cleaned})
-                API_CONVERSATION_HISTORY[sender] = history[-10:]
-                append_history_to_db(sender, message_content, cleaned, keep=10)
+                API_CONVERSATION_HISTORY[sender] = history[-MEMORY_INMEM_LIMIT:]
+                append_history_to_db(sender, message_content, cleaned, keep=MEMORY_KEEP_PER_FRIEND)
                 return cleaned
             else:
                 log(f"API HTTP {res.status_code}: {res.text[:100]}")
