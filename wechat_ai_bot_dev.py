@@ -535,7 +535,7 @@ def generate_ai_reply(sender, message_content):
         payload = {"model": model, "messages": messages, "temperature": 0.7}
         try:
             log(f"🤖 正在调用大模型 ({model}) 回复【{sender}】...")
-            res = requests.post(url, headers=headers, json=payload, timeout=12)
+            res = requests.post(url, headers=headers, json=payload, timeout=30)
             if res.status_code == 200:
                 reply = res.json()["choices"][0]["message"]["content"]
                 cleaned = clean_ai_reply(reply)

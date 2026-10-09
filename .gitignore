@@ -48,6 +48,9 @@ wechat_convo_map.json
 .env.*
 !.env.example
 
+# Local virtual environment
+.venv/
+
 # IDE & OS files
 .vscode/
 .idea/

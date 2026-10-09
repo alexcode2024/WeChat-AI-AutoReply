@@ -548,44 +548,79 @@ class WeChatBotGUI(tk.Tk):
         self.save_ui_to_config(show_msg=False)
         self.txt_test_out.delete("1.0", tk.END)
         self.txt_test_out.insert(tk.END, "🤖 正在调用大模型生成回复...\n")
+        try:
+            self.btn_run_test.configure(state=tk.DISABLED)
+        except Exception:
+            pass
         self.update()
 
-        t0 = time.time()
         oa = self.config_data.get("openai_api", {})
         api_key = oa.get("api_key", "").strip()
         api_base = oa.get("api_base", "https://api.xiaomimimo.com/v1").rstrip("/")
-        model = oa.get("model", "mimo-v2.6-flash")
-        
+
         if not api_key:
-            self.txt_test_out.delete("1.0", tk.END)
-            self.txt_test_out.insert(tk.END, "❌ 请先在【AI 引擎设置】中填入有效的 API Key！")
+            self._show_test_result("❌ 请先在【AI 引擎设置】中填入有效的 API Key！")
             return
-            
-        url = f"{api_base}/chat/completions"
+
+        # 注意: 默认值必须使用 DEFAULT_PROMPTS 中真实存在的键(带 emoji 前缀)。
+        # 原版此处写死为 "真人日常"(不存在),而 Python 会先求值默认参数再调用 get(),
+        # 因此即使配置里已有 system_prompt 也会抛出 KeyError,导致测试按钮静默失败。
+        prompt = self.config_data.get("system_prompt") or DEFAULT_PROMPTS["🌟 真人日常 (默认)"]
+
+        self._test_result = None
+        threading.Thread(
+            target=self._run_test_request,
+            args=(
+                api_base,
+                api_key,
+                oa.get("model", "mimo-v2.6-flash"),
+                prompt,
+                msg,
+                oa.get("temperature", 0.7),
+            ),
+            daemon=True,
+        ).start()
+        self.after(150, self._poll_test_result)
+
+    def _show_test_result(self, text):
+        self.txt_test_out.delete("1.0", tk.END)
+        self.txt_test_out.insert(tk.END, text)
+        try:
+            self.btn_run_test.configure(state=tk.NORMAL)
+        except Exception:
+            pass
+
+    def _poll_test_result(self):
+        if self._test_result is None:
+            self.after(150, self._poll_test_result)
+            return
+        text = self._test_result
+        self._test_result = None
+        self._show_test_result(text)
+
+    def _run_test_request(self, api_base, api_key, model, prompt, msg, temperature):
+        t0 = time.time()
+        url = f"{api_base.rstrip('/')}/chat/completions"
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        prompt = self.config_data.get("system_prompt", DEFAULT_PROMPTS["真人日常"])
         payload = {
             "model": model,
             "messages": [
                 {"role": "system", "content": prompt},
-                {"role": "user", "content": msg}
+                {"role": "user", "content": msg},
             ],
-            "temperature": 0.7
+            "temperature": temperature,
         }
         try:
-            res = requests.post(url, headers=headers, json=payload, timeout=12)
+            res = requests.post(url, headers=headers, json=payload, timeout=30)
             if res.status_code == 200:
                 data = res.json()
                 reply = data["choices"][0]["message"]["content"].strip()
                 dur = round(time.time() - t0, 2)
-                self.txt_test_out.delete("1.0", tk.END)
-                self.txt_test_out.insert(tk.END, f"{reply}\n\n[⏱️ 耗时: {dur} 秒]")
+                self._test_result = f"{reply}\n\n[⏱️ 耗时: {dur} 秒]"
             else:
-                self.txt_test_out.delete("1.0", tk.END)
-                self.txt_test_out.insert(tk.END, f"❌ API 请求失败 (状态码 {res.status_code}):\n{res.text}")
+                self._test_result = f"❌ API 请求失败 (状态码 {res.status_code}):\n{res.text}"
         except Exception as e:
-            self.txt_test_out.delete("1.0", tk.END)
-            self.txt_test_out.insert(tk.END, f"❌ 请求大模型出错: {e}")
+            self._test_result = f"❌ 请求大模型出错: {type(e).__name__}: {e}"
 
     def is_target_bot_process(self, proc):
         try:

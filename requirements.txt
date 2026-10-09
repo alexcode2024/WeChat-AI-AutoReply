@@ -4,3 +4,5 @@ requests>=2.28.0
 psutil>=5.9.0
 pyperclip>=1.8.0
 numpy>=1.21.0
+# Pinned: shapely 2.2.x wheels fail to load the bundled GEOS DLL on some Windows setups
+shapely>=1.7.1,<2.2
