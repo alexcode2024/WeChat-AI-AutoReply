@@ -62,8 +62,12 @@ MEMORY_KEEP_PER_FRIEND = 10000
 MEMORY_LOAD_LIMIT = MEMORY_KEEP_PER_FRIEND
 # 进程内该好友的上下文缓存条数上限
 MEMORY_INMEM_LIMIT = MEMORY_KEEP_PER_FRIEND
-# 每次真正发送给大模型的上下文条数（控制 prompt 体积 / 延迟 / 费用，与存储上限解耦）
+# 每次真正发送给大模型的上下文预算：按"字符数"计（控制 prompt 体积 / 延迟 / 费用，与存储上限解耦）
+MEMORY_CONTEXT_CHAR_LIMIT = 5000
+# 上下文的条数硬上限，防止极端情况下塞入过多碎片消息
 MEMORY_CONTEXT_LIMIT = 500
+# 至少保留的最近上下文条数（保证起码含一轮完整问答）
+MEMORY_CONTEXT_MIN_MSGS = 2
 
 try:
     if sys.stdout:
@@ -592,6 +596,28 @@ def append_history_to_db(sender, user_msg, assistant_msg, keep=MEMORY_KEEP_PER_F
         log(f"⚠️ [长期记忆库写入失败] {e}")
         return False
 
+def select_context_history(history,
+                           char_limit=MEMORY_CONTEXT_CHAR_LIMIT,
+                           max_msgs=MEMORY_CONTEXT_LIMIT,
+                           min_msgs=MEMORY_CONTEXT_MIN_MSGS):
+    """
+    从最近的对话往前取，累计字符数不超过 char_limit，条数不超过 max_msgs。
+    返回值：(选中的消息列表, 实际字符数)。
+    先保证至少 min_msgs 条最新上下文，避免单条超长消息把上下文清空。
+    """
+    picked = []
+    total = 0
+    for item in reversed(history or []):
+        if len(picked) >= max_msgs:
+            break
+        length = len(item.get("content") or "")
+        if len(picked) >= min_msgs and total + length > char_limit:
+            break
+        picked.append(item)
+        total += length
+    picked.reverse()
+    return picked, total
+
 def generate_ai_reply(sender, message_content):
     cfg = load_config()
     now_time = time.strftime("%H:%M")
@@ -616,13 +642,15 @@ def generate_ai_reply(sender, message_content):
         if history is None:
             history = load_history_from_db(sender, limit=MEMORY_LOAD_LIMIT)
             API_CONVERSATION_HISTORY[sender] = history
+        context_msgs, context_chars = select_context_history(history)
         messages = [{"role": "system", "content": system_prompt}]
-        messages.extend(history[-MEMORY_CONTEXT_LIMIT:])
+        messages.extend(context_msgs)
         messages.append({"role": "user", "content": message_content})
         
         payload = {"model": model, "messages": messages, "temperature": 0.7}
         try:
-            log(f"🤖 正在调用大模型 ({model}) 回复【{sender}】...")
+            log(f"🤖 正在调用大模型 ({model}) 回复【{sender}】"
+                f" [上下文 {len(context_msgs)} 条 / {context_chars} 字]...")
             res = requests.post(url, headers=headers, json=payload, timeout=30)
             if res.status_code == 200:
                 reply = res.json()["choices"][0]["message"]["content"]
