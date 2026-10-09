@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import sqlite3
 import subprocess
 import tempfile
 import threading
@@ -26,6 +27,9 @@ LOG_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.log")
 PID_FILE = os.path.join(WORKSPACE_DIR, "wechat_bot_dev.pid")
 BOT_SCRIPT = os.path.join(WORKSPACE_DIR, "wechat_ai_bot_dev.py")
 KILL_SCRIPT = os.path.join(WORKSPACE_DIR, "kill_wechat_bot_dev.py")
+MEMORY_DB_FILE = os.path.join(WORKSPACE_DIR, "wechat_memory.db")
+# 对话历史面板单次最多显示的条数（数据库里仍保留全部）
+HISTORY_DISPLAY_LIMIT = 300
 
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
@@ -146,9 +150,14 @@ class WeChatBotGUI(tk.Tk):
         self.config_data = self.load_config()
         self.log_pos = 0
         self.is_monitoring = True
+        # 对话历史面板状态
+        self.history_sender = None
+        self._history_row_count = None
+        self.live_history = True
         
         self.create_widgets()
         self.load_settings_to_ui()
+        self.refresh_friend_history()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.start_background_monitors()
 
@@ -275,7 +284,7 @@ class WeChatBotGUI(tk.Tk):
 
         log_ctrl_bar = ttk.Frame(log_frame)
         log_ctrl_bar.pack(fill=tk.X, pady=(0, 4))
-        ttk.Label(log_ctrl_bar, text="实时日志流 (记录未读红点、好友消息、AI回复详情):", font=("微软雅黑", 8)).pack(side=tk.LEFT)
+        ttk.Label(log_ctrl_bar, text="实时日志流 (记录未读红点、消息条数与发送状态；不含对话正文):", font=("微软雅黑", 8)).pack(side=tk.LEFT)
         
         ttk.Button(log_ctrl_bar, text="清空日志", command=self.clear_logs).pack(side=tk.RIGHT, padx=2)
         ttk.Button(log_ctrl_bar, text="打开日志文件", command=self.open_log_file).pack(side=tk.RIGHT, padx=2)
@@ -487,6 +496,8 @@ class WeChatBotGUI(tk.Tk):
         top_w = ttk.Frame(self.tab_whitelist)
         top_w.pack(fill=tk.X, pady=(0, 6))
 
+        self.var_hist_live = tk.BooleanVar(value=True)
+
         self.var_wl_mode = tk.BooleanVar(value=True)
         self.chk_wl = ttk.Checkbutton(top_w, text="🔒 开启白名单模式（开启后【仅回复】白名单中的指定好友，未在名单者不回复）", variable=self.var_wl_mode)
         self.chk_wl.pack(side=tk.LEFT)
@@ -500,6 +511,8 @@ class WeChatBotGUI(tk.Tk):
 
         self.listbox_wl = tk.Listbox(left_w, selectmode=tk.SINGLE, font=("微软雅黑", 9))
         self.listbox_wl.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        # 点击白名单好友 -> 在下方展示其对话历史
+        self.listbox_wl.bind("<<ListboxSelect>>", self.on_whitelist_select)
 
         wl_ctrl = ttk.Frame(left_w)
         wl_ctrl.pack(fill=tk.X)
@@ -521,6 +534,113 @@ class WeChatBotGUI(tk.Tk):
         self.ent_add_bl.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
         ttk.Button(bl_ctrl, text="添加屏蔽", command=self.add_blacklist).pack(side=tk.LEFT, padx=2)
         ttk.Button(bl_ctrl, text="删除选中", command=self.del_blacklist).pack(side=tk.LEFT, padx=2)
+
+        # ---- 好友对话历史 (点击左侧白名单好友即可查看) ----
+        hist_frame = ttk.LabelFrame(
+            self.tab_whitelist,
+            text=" 💬 好友对话历史（点击左侧白名单中的好友查看，数据来自本地记忆库） ",
+            padding=8)
+        hist_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+
+        hist_bar = ttk.Frame(hist_frame)
+        hist_bar.pack(fill=tk.X, pady=(0, 4))
+        self.lbl_hist_title = ttk.Label(hist_bar, text="尚未选择好友", font=("微软雅黑", 9, "bold"))
+        self.lbl_hist_title.pack(side=tk.LEFT)
+        ttk.Button(hist_bar, text="🔄 刷新", command=lambda: self.refresh_friend_history(force=True)).pack(side=tk.RIGHT)
+        ttk.Checkbutton(hist_bar, text="自动刷新", variable=self.var_hist_live,
+                        command=self.on_live_history_toggle).pack(side=tk.RIGHT, padx=(0, 8))
+
+        self.txt_history = scrolledtext.ScrolledText(hist_frame, wrap=tk.WORD, height=9, font=("微软雅黑", 9))
+        self.txt_history.pack(fill=tk.BOTH, expand=True)
+        self.txt_history.configure(state=tk.DISABLED)
+
+    # ---------------- 好友对话历史 (从 SQLite 记忆库读取) ----------------
+    def _fetch_history(self, sender):
+        """纯读取，无 UI 操作，可在后台线程安全调用。返回 (rows, total, error)。"""
+        if not os.path.exists(MEMORY_DB_FILE):
+            return [], 0, "尚未生成记忆库文件（守护进程首次回复后会创建 wechat_memory.db）"
+        try:
+            conn = sqlite3.connect(MEMORY_DB_FILE, timeout=3)
+            try:
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM chat_memory WHERE sender = ?", (sender,)).fetchone()[0]
+                rows = conn.execute(
+                    "SELECT role, content, created_at FROM chat_memory WHERE sender = ? "
+                    "ORDER BY id DESC LIMIT ?", (sender, HISTORY_DISPLAY_LIMIT)).fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            return [], 0, f"读取记忆库失败: {e}"
+        rows.reverse()
+        return rows, total, None
+
+    def on_whitelist_select(self, event=None):
+        sel = self.listbox_wl.curselection()
+        if not sel:
+            return
+        name = self.listbox_wl.get(sel[0]).strip()
+        if not name:
+            return
+        self.history_sender = name
+        self._history_row_count = None
+        self.refresh_friend_history(force=True)
+
+    def on_live_history_toggle(self):
+        self.live_history = bool(self.var_hist_live.get())
+
+    @staticmethod
+    def _fmt_history_ts(ts):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+        except Exception:
+            return "----"
+
+    def _is_history_at_bottom(self):
+        try:
+            return self.txt_history.yview()[1] >= 0.999
+        except Exception:
+            return True
+
+    def refresh_friend_history(self, force=False):
+        sender = self.history_sender
+        if not sender:
+            self._history_row_count = None
+            self.txt_history.configure(state=tk.NORMAL)
+            self.txt_history.delete("1.0", tk.END)
+            self.txt_history.insert(tk.END, "请点击左侧白名单中的好友，查看与其的历史对话记录。\n")
+            self.txt_history.configure(state=tk.DISABLED)
+            self.lbl_hist_title.configure(text="尚未选择好友")
+            return
+        rows, total, err = self._fetch_history(sender)
+        self._apply_history(sender, rows, total, err, force=force)
+
+    def _apply_history(self, sender, rows, total, err, force=False):
+        if sender != self.history_sender:
+            return
+        if not force and total == self._history_row_count:
+            return
+        self._history_row_count = total
+        at_bottom = self._is_history_at_bottom()
+
+        self.txt_history.configure(state=tk.NORMAL)
+        self.txt_history.delete("1.0", tk.END)
+        if err:
+            self.txt_history.insert(tk.END, err + "\n")
+        elif not rows:
+            self.txt_history.insert(tk.END, "该好友暂无对话记录。\n")
+        else:
+            self.txt_history.insert(
+                tk.END,
+                f"共 {total} 条记录，此处显示最近 {len(rows)} 条\n{'─' * 48}\n")
+            for role, content, ts in rows:
+                who = "我" if role == "assistant" else "好友"
+                self.txt_history.insert(tk.END, f"[{self._fmt_history_ts(ts)}] {who}: {content}\n")
+        self.txt_history.configure(state=tk.DISABLED)
+
+        self.lbl_hist_title.configure(
+            text=f"【{sender}】{'暂无记录' if not rows else f'共 {total} 条对话记录'}")
+        if at_bottom:
+            self.txt_history.see(tk.END)
 
     # 4. TAB: Test Sandbox
     def build_tab_test(self):
@@ -1003,6 +1123,14 @@ class WeChatBotGUI(tk.Tk):
                         pass
 
                 self.after(0, lambda wt=wx_text, wc=wx_color, bt=bot_text, bc=bot_color, nl=new_logs: self._update_ui_state(wt, wc, bt, bc, nl))
+
+                # 4. 选中好友时增量刷新对话历史（数据库读取放在后台线程，避免卡住界面）
+                if self.live_history and self.history_sender:
+                    sender = self.history_sender
+                    rows, total, err = self._fetch_history(sender)
+                    self.after(0, lambda r=rows, t=total, e=err, s=sender:
+                               self._apply_history(s, r, t, e))
+
                 time.sleep(1.5)
 
         t = threading.Thread(target=monitor_loop, daemon=True)
