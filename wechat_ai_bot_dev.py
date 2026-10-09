@@ -870,7 +870,9 @@ def capture_input_ink_signature(hwnd, layout):
         W, H = img.size
         chat_start_x = layout["chat_start_x"]
         input_h = layout["input_h"]
-        y1 = max(0, int(H - input_h + 0.06 * input_h))
+        # 从输入框上沿内侧起始：输入框有 1px 圆角边框，起始点必须落在边框之下，
+        # 否则既可能把边框线误算成文字，又会漏掉"只有一行"的短回复首行。
+        y1 = max(0, int(H - input_h - 8))
         y2 = min(H, int(H - input_h + 0.55 * input_h))
         x1 = int(chat_start_x + 0.02 * (W - chat_start_x))
         x2 = min(W, int(W * 0.92))
