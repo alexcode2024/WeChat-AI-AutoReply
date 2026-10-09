@@ -3,6 +3,7 @@ import sys
 import time
 import json
 import re
+import sqlite3
 import hashlib
 import ctypes
 from ctypes import wintypes
@@ -52,6 +53,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "wechat_config_dev.json")
 CONVO_MAP_FILE = os.path.join(BASE_DIR, "wechat_convo_map.json")
 PID_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.pid")
 LOG_FILE = os.path.join(BASE_DIR, "wechat_bot_dev.log")
+DB_FILE = os.path.join(BASE_DIR, "wechat_memory.db")
 
 try:
     if sys.stdout:
@@ -508,6 +510,78 @@ def clean_ai_reply(reply):
         reply = reply[1:-1].strip()
     return reply
 
+# =============================================================================
+# 6.5 PERSISTENT MEMORY (SQLite 长期记忆库)
+# =============================================================================
+def init_memory_db():
+    """
+    初始化 SQLite 长期记忆库：
+    按好友维度持久化保存历史对话，进程重启后仍可恢复上下文，杜绝"失忆"。
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS chat_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at REAL NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sender_id ON chat_memory(sender, id)")
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        log(f"⚠️ [长期记忆库初始化失败] {e}")
+        return False
+
+def load_history_from_db(sender, limit=10):
+    """从记忆库按时间正序取出该好友最近 limit 条对话。"""
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        rows = conn.execute(
+            "SELECT role, content FROM chat_memory WHERE sender = ? ORDER BY id DESC LIMIT ?",
+            (sender, int(limit))
+        ).fetchall()
+        conn.close()
+        rows.reverse()
+        return [{"role": r, "content": c} for r, c in rows]
+    except Exception as e:
+        log(f"⚠️ [长期记忆库读取失败] {e}")
+        return []
+
+def append_history_to_db(sender, user_msg, assistant_msg, keep=10):
+    """
+    把"好友新消息 + 我方回复"成对写入记忆库，并只保留该好友最近 keep 条，
+    防止数据库无限膨胀。写入失败绝不影响正常回复流程。
+    """
+    try:
+        conn = sqlite3.connect(DB_FILE, timeout=5)
+        now_ts = time.time()
+        conn.execute(
+            "INSERT INTO chat_memory(sender, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (sender, "user", user_msg, now_ts)
+        )
+        conn.execute(
+            "INSERT INTO chat_memory(sender, role, content, created_at) VALUES (?, ?, ?, ?)",
+            (sender, "assistant", assistant_msg, now_ts)
+        )
+        conn.execute(
+            """DELETE FROM chat_memory
+               WHERE sender = ? AND id NOT IN (
+                   SELECT id FROM chat_memory WHERE sender = ? ORDER BY id DESC LIMIT ?
+               )""",
+            (sender, sender, int(keep))
+        )
+        conn.commit()
+        conn.close()
+        return True
+    except Exception as e:
+        log(f"⚠️ [长期记忆库写入失败] {e}")
+        return False
+
 def generate_ai_reply(sender, message_content):
     cfg = load_config()
     now_time = time.strftime("%H:%M")
@@ -527,7 +601,11 @@ def generate_ai_reply(sender, message_content):
     
     if key and url:
         headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
-        history = API_CONVERSATION_HISTORY.get(sender, [])
+        # 进程内首次触达该好友时，从 SQLite 长期记忆库恢复上下文；之后走内存缓存
+        history = API_CONVERSATION_HISTORY.get(sender)
+        if history is None:
+            history = load_history_from_db(sender, limit=10)
+            API_CONVERSATION_HISTORY[sender] = history
         messages = [{"role": "system", "content": system_prompt}]
         messages.extend(history[-8:])
         messages.append({"role": "user", "content": message_content})
@@ -542,6 +620,7 @@ def generate_ai_reply(sender, message_content):
                 history.append({"role": "user", "content": message_content})
                 history.append({"role": "assistant", "content": cleaned})
                 API_CONVERSATION_HISTORY[sender] = history[-10:]
+                append_history_to_db(sender, message_content, cleaned, keep=10)
                 return cleaned
             else:
                 log(f"API HTTP {res.status_code}: {res.text[:100]}")
@@ -973,6 +1052,10 @@ def main_loop():
             f.write(str(os.getpid()))
     except Exception:
         pass
+
+    # 初始化长期记忆库（SQLite），重启后自动恢复各好友上下文
+    if init_memory_db():
+        log(f"🧠 长期记忆库已就绪: {os.path.basename(DB_FILE)}")
         
     log("=" * 60)
     log("🚀 PC 微信真人拟真 AI 自动回复系统【左右双轨协同感知版】已启动")

@@ -39,6 +39,10 @@ MANIFEST
 wechat_config_dev.json
 wechat_config.json
 wechat_convo_map.json
+# SQLite long-term chat memory (contains private conversation content)
+wechat_memory.db
+wechat_memory.db-journal
+wechat_memory.db-wal
 *.pid
 *.log
 *.tmp
