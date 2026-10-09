@@ -62,10 +62,12 @@ MEMORY_KEEP_PER_FRIEND = 10000
 MEMORY_LOAD_LIMIT = MEMORY_KEEP_PER_FRIEND
 # 进程内该好友的上下文缓存条数上限
 MEMORY_INMEM_LIMIT = MEMORY_KEEP_PER_FRIEND
-# 每次真正发送给大模型的上下文预算：按"字符数"计（控制 prompt 体积 / 延迟 / 费用，与存储上限解耦）
-MEMORY_CONTEXT_CHAR_LIMIT = 5000
-# 上下文的条数硬上限，防止极端情况下塞入过多碎片消息
-MEMORY_CONTEXT_LIMIT = 500
+# 每次真正发送给大模型的上下文：按"对话轮数"计，1 轮 = 好友 1 条 + 我方 1 条
+MEMORY_CONTEXT_TURNS = 150
+# 由轮数换算出的消息条数上限
+MEMORY_CONTEXT_LIMIT = MEMORY_CONTEXT_TURNS * 2
+# 字符数硬上限：正常聊天长度下不会触发，仅在好友发长文时兜底，防止 prompt 撑爆
+MEMORY_CONTEXT_CHAR_LIMIT = 8000
 # 至少保留的最近上下文条数（保证起码含一轮完整问答）
 MEMORY_CONTEXT_MIN_MSGS = 2
 
@@ -603,6 +605,7 @@ def select_context_history(history,
     """
     从最近的对话往前取，累计字符数不超过 char_limit，条数不超过 max_msgs。
     返回值：(选中的消息列表, 实际字符数)。
+    先按条数上限（轮数换算而来）截取，再用字符上限兜底。
     先保证至少 min_msgs 条最新上下文，避免单条超长消息把上下文清空。
     """
     picked = []
@@ -650,7 +653,7 @@ def generate_ai_reply(sender, message_content):
         payload = {"model": model, "messages": messages, "temperature": 0.7}
         try:
             log(f"🤖 正在调用大模型 ({model}) 回复【{sender}】"
-                f" [上下文 {len(context_msgs)} 条 / {context_chars} 字]...")
+                f" [上下文 {len(context_msgs)} 条(约 {len(context_msgs)//2} 轮) / {context_chars} 字]...")
             res = requests.post(url, headers=headers, json=payload, timeout=30)
             if res.status_code == 200:
                 reply = res.json()["choices"][0]["message"]["content"]
