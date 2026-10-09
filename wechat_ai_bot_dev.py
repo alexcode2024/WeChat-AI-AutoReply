@@ -63,7 +63,7 @@ MEMORY_LOAD_LIMIT = MEMORY_KEEP_PER_FRIEND
 # 进程内该好友的上下文缓存条数上限
 MEMORY_INMEM_LIMIT = MEMORY_KEEP_PER_FRIEND
 # 每次真正发送给大模型的上下文条数（控制 prompt 体积 / 延迟 / 费用，与存储上限解耦）
-MEMORY_CONTEXT_LIMIT = 8
+MEMORY_CONTEXT_LIMIT = 500
 
 try:
     if sys.stdout:
