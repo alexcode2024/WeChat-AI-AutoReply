@@ -970,9 +970,6 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         else:
             log(f"🚫 [安全熔断] 未在列表中定位到目标【{target}】，放弃本次发送以防串发！")
             return False
-    # 隐私保护：日志只记录系统元信息，绝不写入对话正文
-    log(f"📤 正在回复【{target}】（{len(final_reply)} 字，正文不记入日志）")
-
     # 剪贴板原子快照保护
     user_old_clip = None
     try:
@@ -990,6 +987,9 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
         log("❌ [发送中止] 未能捕获微信画面，本轮不发送（避免重复发送），稍后自动重试。")
         return False
 
+    # 日志只在"真的抢到前台、确实要开始录入"时才打印，
+    # 避免出现"日志写着正在回复、实际却一个字也没发出去"的误导。
+    announced = False
     for attempt in range(1, 3):
         # 0. 关键前置：必须把微信真正切到前台。键盘事件只会送到前台窗口，
         #    抢不到焦点时按键会打到别的程序里，还会造成"看起来回复了、其实没发出去"的假象。
@@ -998,6 +998,11 @@ def send_reply_instant(hwnd, rect, layout, target, final_reply):
             log("❌ [发送中止] 无法把微信窗口切到前台（前台可能被全屏程序/游戏占用），"
                 "本轮未发出任何内容，稍后自动重试。")
             break
+
+        if not announced:
+            # 隐私保护：日志只记录系统元信息，绝不写入对话正文
+            log(f"📤 正在回复【{target}】（{len(final_reply)} 字，正文不记入日志）")
+            announced = True
 
         # 1. 局部消息模拟点击输入框聚焦 (物理鼠标 0 像素移动)
         post_click_client_point(hwnd, int(0.55 * cur_W), int(cur_H - 0.08 * cur_H))
