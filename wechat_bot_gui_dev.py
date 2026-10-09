@@ -788,6 +788,9 @@ class WeChatBotGUI(tk.Tk):
         try:
             with open(LOG_FILE, "w", encoding="utf-8") as f:
                 f.write("")
+            # 关键：文件被截断后必须同步重置读取游标，否则监控线程仍从旧偏移 seek，
+            # 而旧偏移已超出文件末尾，read() 永远返回空，日志面板将长期空白。
+            self.log_pos = 0
             self.txt_log.delete("1.0", tk.END)
         except Exception:
             pass
@@ -883,6 +886,9 @@ class WeChatBotGUI(tk.Tk):
                 new_logs = ""
                 if os.path.exists(LOG_FILE):
                     try:
+                        # 外部清空/轮转会让文件尺寸小于读取游标，此时自动归零重新读全量
+                        if os.path.getsize(LOG_FILE) < self.log_pos:
+                            self.log_pos = 0
                         with open(LOG_FILE, "r", encoding="utf-8", errors="ignore") as f:
                             f.seek(self.log_pos)
                             new_logs = f.read()
